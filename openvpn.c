@@ -33,6 +33,7 @@
 #include <process.h>
 #include <richedit.h>
 #include <time.h>
+#include <string.h>
 
 #include "tray.h"
 #include "main.h"
@@ -331,21 +332,31 @@ UserAuthDialogFunc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 INT_PTR CALLBACK
 PrivKeyPassDialogFunc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    connection_t *c;
+    connection_t *c = NULL;
     WCHAR passphrase[KEY_PASS_LEN];
+
+    auth_param_t *param = (auth_param_t *) lParam;
+    char cmd[200];
+    const char *cmd_private_key = "password \"Private Key\" \"%%s\"";
+    const char *cmd_other_key   = "password \"%s\" \"%%s\"";
 
     switch (msg)
     {
     case WM_INITDIALOG:
         /* Set connection for this dialog and show it */
-        c = (connection_t *) lParam;
-        SetProp(hwndDlg, cfgProp, (HANDLE) c);
+        SetProp(hwndDlg, cfgProp, (HANDLE) param);
+        c = param->c;
         if (RecallKeyPass(c->config_name, passphrase) && wcslen(passphrase))
         {
             /* Use the saved password and skip the dialog */
             SetDlgItemTextW(hwndDlg, ID_EDT_PASSPHRASE, passphrase);
             SecureZeroMemory(passphrase, sizeof(passphrase));
-            ManagementCommandFromInput(c, "password \"Private Key\" \"%s\"", hwndDlg, ID_EDT_PASSPHRASE);
+            if (param->challenge_echo) {
+                snprintf(cmd, sizeof(cmd), cmd_other_key, param->challenge_str);
+            } else {
+                snprintf(cmd, sizeof(cmd), cmd_private_key);
+            }
+            ManagementCommandFromInput(c, cmd, hwndDlg, ID_EDT_PASSPHRASE);
             EndDialog(hwndDlg, IDOK);
             return TRUE;
         }
@@ -358,7 +369,8 @@ PrivKeyPassDialogFunc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_COMMAND:
-        c = (connection_t *) GetProp(hwndDlg, cfgProp);
+        param = (auth_param_t *) GetProp(hwndDlg, cfgProp);
+        c = param->c;
         switch (LOWORD(wParam))
         {
         case ID_CHK_SAVE_PASS:
@@ -380,7 +392,12 @@ PrivKeyPassDialogFunc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
                 SaveKeyPass(c->config_name, passphrase);
                 SecureZeroMemory(passphrase, sizeof(passphrase));
             }
-            ManagementCommandFromInput(c, "password \"Private Key\" \"%s\"", hwndDlg, ID_EDT_PASSPHRASE);
+            if (param->challenge_echo) {
+                snprintf(cmd, sizeof(cmd), cmd_other_key, param->challenge_str);
+            } else {
+                snprintf(cmd, sizeof(cmd), cmd_private_key);
+            }
+            ManagementCommandFromInput(c, cmd, hwndDlg, ID_EDT_PASSPHRASE);
             EndDialog(hwndDlg, LOWORD(wParam));
             return TRUE;
 
@@ -432,7 +449,11 @@ OnPassword(connection_t *c, char *msg)
     }
     else if (strstr(msg, "'Private Key'"))
     {
-        LocalizedDialogBoxParam(ID_DLG_PASSPHRASE, PrivKeyPassDialogFunc, (LPARAM) c);
+        auth_param_t *param = (auth_param_t *) malloc(sizeof(auth_param_t));
+        param->challenge_echo = 0;
+        param->challenge_str = "";
+        param->c = c;
+        LocalizedDialogBoxParam(ID_DLG_PASSPHRASE, PrivKeyPassDialogFunc, (LPARAM) param);
     }
     else if (strstr(msg, "'HTTP Proxy'"))
     {
@@ -441,6 +462,36 @@ OnPassword(connection_t *c, char *msg)
     else if (strstr(msg, "'SOCKS Proxy'"))
     {
         QueryProxyAuth(c, socks);
+    }
+    else
+    {
+        /* process all other auth requests, e.g. PIN queries from smartcards */
+        /* fix for https://community.openvpn.net/openvpn/ticket/740 */
+        char *msg2 = strdup(msg);
+        char *sep = msg2;
+        char *saveptr;
+        auth_param_t *param = (auth_param_t *) malloc(sizeof (auth_param_t));
+        param->challenge_echo = 1;
+        param->challenge_str = "";
+        param->c = c;
+        sep = strtok_r(sep, "'", &saveptr);
+        if (sep != NULL) {
+            sep = strtok_r(NULL, "'", &saveptr);
+            /* extract the auth name, e.g. "PIV_II (PIV Card Holder pin) token"
+             * from ">PASSWORD:Need 'PIV_II (PIV Card Holder pin) token' password" */
+            param->challenge_str = strdup(sep);
+        }
+        /* TODO: Make an extra dialog
+         * The PrivKeyPassDialogFunc dialog does not match all requirements:
+         *
+         * 1) users normally must not save PINs, e.g. for security reasons and
+         *    because false PIN inputs may lock the PINs after some attempts
+         * 2) it may be possible to detect PIN requests, e.g. by the word "pin"
+         * 3) the auth name is not displayed in dialog
+         * 4) the data structure auth_param_t does not match here
+         */
+        LocalizedDialogBoxParam(ID_DLG_PASSPHRASE, PrivKeyPassDialogFunc, (LPARAM) param);
+        free(msg2);
     }
 }
 
